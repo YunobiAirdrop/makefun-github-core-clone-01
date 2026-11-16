@@ -41,7 +41,14 @@ export interface TreeEntry {
   oid: string;
 }
 
+// Parsed views of stored objects, memoised by the identity of their (immutable, content-addressed)
+// data buffer: the same object is re-parsed on every fetch walk, ancestor check and tree flatten,
+// and no caller ever mutates a returned view, so handing back the cached parse is exact.
+const treeViewCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeViewCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -56,6 +63,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     });
     offset = nul + 21;
   }
+  treeViewCache.set(data, entries);
   return entries;
 }
 
@@ -143,7 +151,11 @@ export interface CommitView {
   message: string;
 }
 
+const commitViewCache = new WeakMap<Buffer, CommitView>();
+
 export function parseCommit(data: Buffer): CommitView {
+  const cached = commitViewCache.get(data);
+  if (cached !== undefined) return cached;
   const blank = data.indexOf('\n\n');
   const headerEnd = blank < 0 ? data.length : blank;
   const headerText = data.subarray(0, headerEnd).toString('utf8');
@@ -157,7 +169,9 @@ export function parseCommit(data: Buffer): CommitView {
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  return { tree, parents, author, committer, message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8') };
+  const view: CommitView = { tree, parents, author, committer, message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8') };
+  commitViewCache.set(data, view);
+  return view;
 }
 
 export function buildCommit(fields: { tree: string; parents: readonly string[]; author: string; committer: string; message: string }): Buffer {
@@ -173,7 +187,11 @@ export interface TagView {
   tag: string;
 }
 
+const tagViewCache = new WeakMap<Buffer, TagView>();
+
 export function parseTag(data: Buffer): TagView {
+  const cached = tagViewCache.get(data);
+  if (cached !== undefined) return cached;
   const blank = data.indexOf('\n\n');
   const headerEnd = blank < 0 ? data.length : blank;
   let object = '';
@@ -184,7 +202,9 @@ export function parseTag(data: Buffer): TagView {
     else if (line.startsWith('type ')) type = line.slice(5).trim();
     else if (line.startsWith('tag ')) tag = line.slice(4).trim();
   }
-  return { object, type, tag };
+  const view: TagView = { object, type, tag };
+  tagViewCache.set(data, view);
+  return view;
 }
 
 /** Follow tag objects to the commit they name; null when the chain does not end at a commit. */
@@ -488,7 +508,9 @@ function writePackObjectHeader(type: ObjType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Build a packfile from plain objects (no deltas). */
+/** Build a packfile from plain objects (no deltas). Compression level 1: the wire format and the
+ * inflated bytes are unchanged, only the deflate effort (and so the CPU per pack) drops. The
+ * trailer hash is fed part by part so the body is concatenated once, not twice. */
 export function writePack(objects: Iterable<{ type: ObjType; data: Buffer }>): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
@@ -499,10 +521,12 @@ export function writePack(objects: Iterable<{ type: ObjType; data: Buffer }>): B
   parts.push(header);
   for (const object of list) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const hash = createHash('sha1');
+  for (const part of parts) hash.update(part);
+  parts.push(hash.digest());
+  return Buffer.concat(parts);
 }
 
 // ---------------------------------------------------------------- pkt-line

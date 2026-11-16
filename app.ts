@@ -13,12 +13,13 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
 function sendResult(res: ServerResponse, result: HttpResult, extraHeaders: Record<string, string> = {}): void {
-  res.writeHead(result.status, {
+  const headers: Record<string, string | number> = {
     'content-type': result.contentType,
     'content-length': result.body.length,
-    ...extraHeaders,
-    ...(result.headers ?? {}),
-  });
+  };
+  for (const name of Object.keys(extraHeaders)) headers[name] = extraHeaders[name] as string;
+  if (result.headers !== undefined) for (const name of Object.keys(result.headers)) headers[name] = result.headers[name] as string;
+  res.writeHead(result.status, headers);
   res.end(result.body);
 }
 
@@ -45,34 +46,50 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function authorized(req: IncomingMessage): boolean {
-  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (token === '') return false;
-  const header = req.headers.authorization;
-  return typeof header === 'string' && header === `Bearer ${token}`;
+/** decodeURIComponent for one path segment, skipping the call entirely when nothing is escaped. */
+function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
+  // The bearer token is fixed for the process's life (the harness sets it before the server
+  // exists), so the expected Authorization header is built once instead of on every request.
+  let expectedAuth: string | null = null;
+  const authorized = (req: IncomingMessage): boolean => {
+    if (expectedAuth === null) {
+      const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+      if (token === '') return false;
+      expectedAuth = `Bearer ${token}`;
+    }
+    return req.headers.authorization === expectedAuth;
+  };
+
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
       const method = req.method ?? 'GET';
-      let url: URL;
-      try {
-        url = new URL(req.url ?? '/', 'http://entry');
-      } catch {
+      // Split the request target by hand: a full URL parse per request buys nothing here —
+      // the router needs only the raw path (still percent-encoded, exactly as URL.pathname
+      // reported it) and the query parameters.
+      const rawUrl = req.url ?? '/';
+      const queryAt = rawUrl.indexOf('?');
+      const path = queryAt < 0 ? rawUrl : rawUrl.slice(0, queryAt);
+      if (!path.startsWith('/')) {
         sendJson(res, 400, { message: 'Bad Request' });
         return;
       }
-      const path = url.pathname;
+      const query = new URLSearchParams(queryAt < 0 ? '' : rawUrl.slice(queryAt + 1));
 
       // The env's boot probe: no auth.
       if (method === 'GET' && path === '/healthz') {
         sendJson(res, 200, { ok: true });
         return;
       }
-
-      const isApi = path === '/api/v3' || path.startsWith('/api/v3/') || path === '/api/graphql' || path === '/mcp' || /^\/[^/]+\/[^/]+\.git(\/|$)/.test(path);
 
       if (!authorized(req)) {
         const headers: Record<string, string> = {};
@@ -100,31 +117,24 @@ export function createApp(): Server {
 
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           const rawSegments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/');
-          const segments = rawSegments.filter((segment) => segment !== '').map((segment) => {
-            try {
-              return decodeURIComponent(segment);
-            } catch {
-              return segment;
-            }
-          });
+          const segments = rawSegments.filter((segment) => segment !== '').map(decodeSegment);
           // A trailing slash on the API root still means the root.
           const host = typeof req.headers.host === 'string' && req.headers.host !== '' ? req.headers.host : 'localhost';
-          const result = handleRest({ method, segments, query: url.searchParams, rawBody: body, host });
+          const result = handleRest({ method, segments, query, rawBody: body, host });
           sendResult(res, result, { 'x-github-request-id': nextRequestId() });
           return;
         }
 
         const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
         if (gitMatch !== null) {
-          const owner = decodeURIComponent(gitMatch[1] as string);
-          const repoName = decodeURIComponent(gitMatch[2] as string);
+          const owner = decodeSegment(gitMatch[1] as string);
+          const repoName = decodeSegment(gitMatch[2] as string);
           const subPath = gitMatch[3] ?? '';
           const gitProtocol = typeof req.headers['git-protocol'] === 'string' ? (req.headers['git-protocol'] as string) : undefined;
-          sendResult(res, handleGit(owner, repoName, subPath, method, url.searchParams, body, gitProtocol));
+          sendResult(res, handleGit(owner, repoName, subPath, method, query, body, gitProtocol));
           return;
         }
 
-        void isApi;
         sendJson(res, 404, { message: 'Not Found' });
       } catch {
         if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });

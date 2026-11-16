@@ -13,6 +13,7 @@ import {
   isoAt,
   mergePull,
   pullChanges,
+  pullCommits,
   pullConflicts,
   repoById,
   type IssueRec,
@@ -896,7 +897,35 @@ function resolveField(typeName: string, source: GqlObj, field: string, args: Rec
         };
       }
       case 'commits': {
-        return { __typename: 'PullRequestCommitConnection', _nodes: [], _edges: [], _pageInfo: pageInfo(false, false, null, null), totalCount: 0 };
+        const commits = pullCommits(repo, pull);
+        const nodes = commits.map((commit, index) => ({
+          __typename: 'PullRequestCommit',
+          _index: index,
+          id: gid('prcommit', repo.id, pull.number, commit.oid),
+          oid: commit.oid,
+          message: commit.message,
+          committedDate: commit.committedDate,
+          author: viewerObj(),
+        }));
+        let start = 0;
+        if (typeof args.after === 'string') {
+          const afterIndex = numberFromCursor(args.after);
+          if (afterIndex !== null) start = Math.min(nodes.length, afterIndex + 1);
+        }
+        const first = typeof args.first === 'number' ? Math.max(0, Math.trunc(args.first)) : nodes.length;
+        const page = nodes.slice(start, start + first);
+        return {
+          __typename: 'PullRequestCommitConnection',
+          _nodes: page,
+          _edges: page.map((node) => ({ __typename: 'PullRequestCommitEdge', node, cursor: cursorFor(node._index) })),
+          _pageInfo: pageInfo(
+            start + page.length < nodes.length,
+            start > 0,
+            page.length > 0 ? cursorFor((page[0] as { _index: number })._index) : null,
+            page.length > 0 ? cursorFor((page[page.length - 1] as { _index: number })._index) : null,
+          ),
+          totalCount: nodes.length,
+        };
       }
       case 'comments': {
         return { __typename: 'IssueCommentConnection', _nodes: [], _edges: [], _pageInfo: pageInfo(false, false, null, null), totalCount: 0 };

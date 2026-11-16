@@ -5,6 +5,7 @@
 import {
   buildCommit,
   buildTreeFromFlat,
+  commitAncestors,
   flattenTree,
   hashObject,
   isAncestor,
@@ -107,8 +108,18 @@ export function nextSeq(): number {
   return sequence;
 }
 
+// isoAt is a pure function of seq, and hot serializers ask for the same seq many times over
+// (created_at and updated_at of one record, then every re-read of that record): memoise it.
+// The map is cleared when it grows past a bound so a long-lived process stays flat.
+const isoCache = new Map<number, string>();
+
 export function isoAt(seq: number): string {
-  return new Date((EPOCH_BASE + seq) * 1000).toISOString();
+  const cached = isoCache.get(seq);
+  if (cached !== undefined) return cached;
+  const value = new Date((EPOCH_BASE + seq) * 1000).toISOString();
+  if (isoCache.size >= 8192) isoCache.clear();
+  isoCache.set(seq, value);
+  return value;
 }
 
 let repoIdCounter = 0;
@@ -436,6 +447,41 @@ export function pullChanges(repo: RepoRec, pull: PullRec): FileChange[] {
     }
   }
   return changes;
+}
+
+export interface PullCommitInfo {
+  oid: string;
+  message: string;
+  committedDate: string;
+}
+
+/** The commits a pull request adds: reachable from the head tip but not from the merge base
+ * (the base tip itself when the branches share no history), newest first. */
+export function pullCommits(repo: RepoRec, pull: PullRec): PullCommitInfo[] {
+  const headTip = branchTip(repo, pull.headRef);
+  const baseTip = branchTip(repo, pull.baseRef);
+  if (headTip === null || baseTip === null) return [];
+  const headCommit = peelToCommit(repo.objects, headTip);
+  const baseCommit = peelToCommit(repo.objects, baseTip);
+  if (headCommit === null || baseCommit === null) return [];
+  const base = mergeBase(repo.objects, baseCommit, headCommit);
+  const excluded = base === null ? new Set<string>() : commitAncestors(repo.objects, base);
+  const out: PullCommitInfo[] = [];
+  const seen = new Set<string>();
+  const stack = [headCommit];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid) || excluded.has(oid)) continue;
+    seen.add(oid);
+    const object = repo.objects.get(oid);
+    if (object === undefined || object.type !== 'commit') continue;
+    const commit = parseCommit(object.data);
+    const match = / (\d+) [+-]\d{4}$/.exec(commit.author);
+    const ts = match === null ? EPOCH_BASE : Number.parseInt(match[1] as string, 10);
+    out.push({ oid, message: commit.message, committedDate: new Date(ts * 1000).toISOString() });
+    for (let i = commit.parents.length - 1; i >= 0; i -= 1) stack.push(commit.parents[i] as string);
+  }
+  return out;
 }
 
 /** Whether merging `pull` today would conflict: a path both sides changed since the merge base. */

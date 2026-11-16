@@ -68,11 +68,16 @@ function advertisementV0(repo: RepoRec, service: string): HttpResult {
   return { status: 200, contentType: `application/x-${service}-advertisement`, body: Buffer.concat(parts) };
 }
 
-function advertisementV2(): HttpResult {
+// The v2 advertisement names no ref and never changes: build its body once, serve it forever.
+const ADVERTISEMENT_V2_BODY: Buffer = (() => {
   const lines = ['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n'];
   const parts = lines.map((line) => encodePktLine(line));
   parts.push(pktFlush());
-  return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: Buffer.concat(parts) };
+  return Buffer.concat(parts);
+})();
+
+function advertisementV2(): HttpResult {
+  return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: ADVERTISEMENT_V2_BODY };
 }
 
 function infoRefs(repo: RepoRec, service: string, gitProtocol: string | undefined): HttpResult {
@@ -140,7 +145,10 @@ interface FetchSelection {
 
 function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelection {
   const objects = repo.objects;
-  // Commit distances from the wants (tags peel to their commit at distance 1).
+  // Commit distances from the wants (tags peel to their commit at distance 1). The walk is a
+  // queue with a read index (no O(n) shift per step) and, for a shallow fetch, it never expands
+  // a commit already at the depth limit: its parents can only land beyond the limit, so the
+  // included set — and therefore the pack — is exactly the one the unbounded walk produced.
   const distances = new Map<string, number>();
   const queue: { oid: string; distance: number }[] = [];
   for (const want of request.wants) {
@@ -150,8 +158,9 @@ function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelectio
       queue.push({ oid: commit, distance: 1 });
     }
   }
-  while (queue.length > 0) {
-    const { oid, distance } = queue.shift() as { oid: string; distance: number };
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, distance } = queue[head] as { oid: string; distance: number };
+    if (request.depth !== null && distance >= request.depth) continue;
     const object = objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
     for (const parent of parseCommit(object.data).parents) {
@@ -176,8 +185,9 @@ function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelectio
     if (object.type === 'commit') {
       if (!includedCommits.has(oid)) continue;
       candidate.add(oid);
-      walk.push(parseCommit(object.data).tree);
-      for (const parent of parseCommit(object.data).parents) walk.push(parent);
+      const commit = parseCommit(object.data);
+      walk.push(commit.tree);
+      for (const parent of commit.parents) walk.push(parent);
     } else if (object.type === 'tag') {
       candidate.add(oid);
       walk.push(parseTag(object.data).object);
@@ -200,7 +210,8 @@ function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelectio
     }
   }
   const clientShallow = new Set(request.shallow.filter((oid) => isOid(oid)));
-  const haveClosure = reachableObjects(objects, request.haves.filter((oid) => objects.has(oid)), clientShallow);
+  const presentHaves = request.haves.filter((oid) => objects.has(oid));
+  const haveClosure = presentHaves.length === 0 ? new Set<string>() : reachableObjects(objects, presentHaves, clientShallow);
   const rank = (type: GitObj['type']): number => (type === 'tag' ? 0 : type === 'commit' ? 1 : type === 'tree' ? 2 : 3);
   const list: FetchSelection['objects'] = [];
   for (const oid of candidate) {
@@ -213,9 +224,44 @@ function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelectio
   return { objects: list, shallow: [...boundary], unshallow };
 }
 
+// Generated packs are a pure function of the request and the object store's contents: objects
+// are content-addressed and immutable, and the key carries the store size, so any push (which
+// only ever adds objects) changes the key before a stale pack could be served. Repeated fetches
+// of the same tip — fifty concurrent shallow clones of one repository above all — reuse the
+// first pack byte for byte instead of re-walking and re-deflating the same objects each time.
+interface PackCacheEntry {
+  pack: Buffer;
+  shallow: string[];
+  unshallow: string[];
+}
+
+const packCache = new Map<string, PackCacheEntry>();
+const PACK_CACHE_LIMIT = 256;
+
+function packCacheKey(repo: RepoRec, request: FetchRequest): string {
+  const sorted = (values: string[]): string => [...values].sort().join(',');
+  return [
+    repo.owner,
+    repo.name,
+    repo.objects.size,
+    request.depth ?? '',
+    sorted(request.wants),
+    sorted(request.haves),
+    sorted(request.shallow),
+  ].join('|');
+}
+
 function buildPack(repo: RepoRec, request: FetchRequest): { pack: Buffer; selection: FetchSelection } {
+  const key = packCacheKey(repo, request);
+  const hit = packCache.get(key);
+  if (hit !== undefined) {
+    return { pack: hit.pack, selection: { objects: [], shallow: hit.shallow, unshallow: hit.unshallow } };
+  }
   const selection = selectFetchObjects(repo, request);
-  return { pack: writePack(selection.objects), selection };
+  const pack = writePack(selection.objects);
+  if (packCache.size >= PACK_CACHE_LIMIT) packCache.clear();
+  packCache.set(key, { pack, shallow: selection.shallow, unshallow: selection.unshallow });
+  return { pack, selection };
 }
 
 function fetchV2(repo: RepoRec, request: FetchRequest): HttpResult {

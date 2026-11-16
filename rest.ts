@@ -95,6 +95,50 @@ function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
   };
 }
 
+// The serialized body of one issue, memoised on the issue record. A cached body is served only
+// when every input of issueJson is provably unchanged: title/body/state by value, the labels
+// array by identity (every mutation path replaces it), the comment count, and each label's
+// record by identity (label records are never mutated in place — they are created or deleted,
+// both of which change what repo.labels.get returns). Any doubt falls through to a fresh build,
+// so the bytes served are always the bytes issueJson would have produced now.
+interface IssueBodyCache {
+  title: string;
+  body: string;
+  state: string;
+  labelsRef: string[];
+  labelRecs: (LabelRec | undefined)[];
+  comments: number;
+  payload: Buffer;
+}
+
+const issueBodyCache = new WeakMap<IssueRec, IssueBodyCache>();
+
+function issueResult(repo: RepoRec, issue: IssueRec): HttpResult {
+  const cached = issueBodyCache.get(issue);
+  if (
+    cached !== undefined &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.labelsRef === issue.labels &&
+    cached.comments === issue.comments.length &&
+    cached.labelRecs.every((rec, index) => repo.labels.get(issue.labels[index] as string) === rec)
+  ) {
+    return { status: 200, contentType: JSON_TYPE, body: cached.payload };
+  }
+  const payload = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, {
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labelsRef: issue.labels,
+    labelRecs: issue.labels.map((name) => repo.labels.get(name)),
+    comments: issue.comments.length,
+    payload,
+  });
+  return { status: 200, contentType: JSON_TYPE, body: payload };
+}
+
 function commentJson(comment: { id: number; body: string; seq: number }): Record<string, unknown> {
   return {
     id: comment.id,
@@ -493,7 +537,7 @@ function issueRoutes(repo: RepoRec, rest: string[], req: RestRequest): HttpResul
   const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
   if (rest.length === 1) {
     if (issue === undefined) return notFound();
-    if (method === 'GET') return json(200, issueJson(repo, issue));
+    if (method === 'GET') return issueResult(repo, issue);
     if (method === 'PATCH') {
       const parsed = parseBody(req);
       if ('error' in parsed) return parsed.error;
