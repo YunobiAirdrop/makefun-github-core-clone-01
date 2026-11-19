@@ -1318,7 +1318,15 @@ function infoRefs(res: ServerResponse, repo: Repo, service: string, version2: bo
   sendRaw(res, 200, body, contentType);
 }
 
+const lsRefsCache = new Map<string, { version: number; body: Buffer }>();
+
 function handleLsRefs(res: ServerResponse, repo: Repo, args: string[]): void {
+  const cacheKey = `${repo.id}|${args.join(' ')}`;
+  const hit = lsRefsCache.get(cacheKey);
+  if (hit && hit.version === repo.refsVersion) {
+    sendRaw(res, 200, hit.body, 'application/x-git-upload-pack-result');
+    return;
+  }
   let peel = false;
   let symrefs = false;
   let unborn = false;
@@ -1350,7 +1358,9 @@ function handleLsRefs(res: ServerResponse, repo: Repo, args: string[]): void {
     out.push(pkt(`${oid} ${name}${suffix}\n`));
   }
   out.push(PKT_FLUSH);
-  sendRaw(res, 200, Buffer.concat(out), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(out);
+  lsRefsCache.set(cacheKey, { version: repo.refsVersion, body });
+  sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 function fetchResponseV2(repo: Repo, args: string[]): Buffer {
