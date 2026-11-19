@@ -2616,9 +2616,74 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 // the server
 // ---------------------------------------------------------------------------
 
+// Fast paths for the two benchmark-shaped REST calls (single-issue read and
+// issue creation, plus the single-repository read): they skip URL parsing and
+// answer from the cached serialisations. Anything that does not match the
+// exact pattern falls through to the general router below.
+const FAST_REPO_GET = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)$/;
+const FAST_ISSUE_GET = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
+const FAST_ISSUE_POST = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/;
+
+function tryFastPath(req: IncomingMessage, res: ServerResponse): Promise<boolean> | boolean {
+  const rawUrl = req.url ?? '';
+  const q = rawUrl.indexOf('?');
+  const path = q >= 0 ? rawUrl.slice(0, q) : rawUrl;
+  const method = req.method ?? 'GET';
+  if (method === 'GET') {
+    let m = FAST_ISSUE_GET.exec(path);
+    if (m) {
+      if (!authed(req)) { sendError(res, 401, 'Requires authentication'); return true; }
+      const owner = decodeURIComponent(m[1]);
+      learnOwner(owner);
+      const repo = findRepo(owner, decodeURIComponent(m[2]));
+      const num = Number(m[3]);
+      const issue = repo ? repo.issues[num - 1] : undefined;
+      if (!repo || !issue || issue.number !== num) { sendError(res, 404, 'Not Found'); return true; }
+      sendRaw(res, 200, issue.json, JSON_TYPE);
+      return true;
+    }
+    m = FAST_REPO_GET.exec(path);
+    if (m) {
+      if (!authed(req)) { sendError(res, 401, 'Requires authentication'); return true; }
+      const owner = decodeURIComponent(m[1]);
+      learnOwner(owner);
+      const repo = findRepo(owner, decodeURIComponent(m[2]));
+      if (!repo) { sendError(res, 404, 'Not Found'); return true; }
+      sendRaw(res, 200, repo.json, JSON_TYPE);
+      return true;
+    }
+    return false;
+  }
+  if (method === 'POST') {
+    const m = FAST_ISSUE_POST.exec(path);
+    if (m) {
+      return (async (): Promise<boolean> => {
+        const raw = await readBody(req);
+        if (!authed(req)) { sendError(res, 401, 'Requires authentication'); return true; }
+        const parsed = parseJsonBody(raw);
+        if (!parsed.ok) { sendError(res, 400, 'Problems parsing JSON'); return true; }
+        const owner = decodeURIComponent(m[1]);
+        learnOwner(owner);
+        const repo = findRepo(owner, decodeURIComponent(m[2]));
+        if (!repo) { sendError(res, 404, 'Not Found'); return true; }
+        const body = parsed.value;
+        const labelNames = Array.isArray(body.labels) ? (body.labels as unknown[]).map((l) => typeof l === 'string' ? l : String((l as Record<string, unknown>)?.name ?? '')) : [];
+        for (const n of labelNames) {
+          if (!repo.labels.has(n)) { sendError(res, 422, 'Validation Failed: label does not exist'); return true; }
+        }
+        const issue = createIssueRec(repo, String(body.title ?? ''), String(body.body ?? ''), labelNames);
+        sendRaw(res, 201, issue.json, JSON_TYPE);
+        return true;
+      })();
+    }
+  }
+  return false;
+}
+
 export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const handle = async (): Promise<void> => {
+      if (await tryFastPath(req, res)) return;
       let url: URL;
       try {
         url = new URL(req.url ?? '/', 'http://forge');
