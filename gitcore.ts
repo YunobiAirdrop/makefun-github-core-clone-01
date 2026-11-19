@@ -357,8 +357,8 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 // ---------------------------------------------------------------- packfiles
 
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
-  const result = inflateSync(buffer.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+function inflateAt(buffer: Buffer, offset: number, end: number): { data: Buffer; next: number } {
+  const result = inflateSync(buffer.subarray(offset, end), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
   const written = result.engine.bytesWritten;
   if (!written || written <= 0) throw new Error(`zlib stream at offset ${offset} consumed no bytes`);
   return { data: result.buffer, next: offset + written };
@@ -442,7 +442,7 @@ export function readPack(pack: Buffer, resolveExternal?: (oid: string) => GitObj
     } else if (CODE_TYPE[typeCode] === undefined) {
       throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(pack, offset, trailerStart);
     if (inflated.data.length !== header.size) throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     entry.data = inflated.data;
     offset = inflated.next;
@@ -450,6 +450,26 @@ export function readPack(pack: Buffer, resolveExternal?: (oid: string) => GitObj
     byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) throw new Error('pack has stray bytes before its trailer');
+
+  const objects = new Map<string, GitObj>();
+  // Plain packs (no delta entries — everything the suite's own client writes) resolve in one
+  // direct pass: hash each inflated object and store it, with none of the delta machinery's
+  // maps, sets or closures allocated.
+  let hasDelta = false;
+  for (const entry of raw) {
+    if (entry.typeCode === 6 || entry.typeCode === 7) {
+      hasDelta = true;
+      break;
+    }
+  }
+  if (!hasDelta) {
+    for (const entry of raw) {
+      const resolved: GitObj = { type: CODE_TYPE[entry.typeCode] as ObjType, data: entry.data };
+      const oid = hashObject(resolved.type, resolved.data);
+      if (!objects.has(oid)) objects.set(oid, resolved);
+    }
+    return objects;
+  }
 
   const resolvedByOid = new Map<string, RawEntry>();
   const resolving = new Set<number>();
@@ -485,7 +505,6 @@ export function readPack(pack: Buffer, resolveExternal?: (oid: string) => GitObj
     return { ...resolved, oid };
   };
 
-  const objects = new Map<string, GitObj>();
   for (const entry of raw) {
     const resolved = resolve(entry);
     if (!objects.has(resolved.oid)) objects.set(resolved.oid, { type: resolved.type, data: resolved.data });
@@ -545,6 +564,34 @@ export function pktFlush(): Buffer {
   return Buffer.from('0000', 'ascii');
 }
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Frame many payloads as pkt-lines in one allocation: the total size is summed first, then
+ * each 4-hex header and payload is written straight into the single output buffer. */
+export function pktLines(payloads: readonly (string | Buffer)[]): Buffer {
+  const buffers: Buffer[] = new Array(payloads.length);
+  let total = 0;
+  for (let i = 0; i < payloads.length; i += 1) {
+    const payload = payloads[i] as string | Buffer;
+    const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
+    if (data.length > PKT_MAX_PAYLOAD) throw new Error(`pkt-line payload is ${data.length} bytes, too large`);
+    buffers[i] = data;
+    total += data.length + 4;
+  }
+  const out = Buffer.allocUnsafe(total);
+  let offset = 0;
+  for (const data of buffers) {
+    const length = data.length + 4;
+    out[offset] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+    out[offset + 1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+    out[offset + 2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+    out[offset + 3] = HEX_DIGITS.charCodeAt(length & 0xf);
+    data.copy(out, offset + 4);
+    offset += length;
+  }
+  return out;
+}
+
 export function pktDelim(): Buffer {
   return Buffer.from('0001', 'ascii');
 }
@@ -556,9 +603,23 @@ export function decodePktLines(bytes: Buffer): { items: PktItem[]; consumed: num
   const items: PktItem[] = [];
   let offset = 0;
   while (offset + 4 <= bytes.length) {
-    const header = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) break;
-    const length = Number.parseInt(header, 16);
+    // A pkt-line length is exactly four lowercase-or-uppercase hex digits; anything else
+    // (the 'PACK' that follows a push's command list, say) ends the framed prefix.
+    let length = 0;
+    let framed = true;
+    for (let i = 0; i < 4; i += 1) {
+      const code = bytes[offset + i] as number;
+      let digit: number;
+      if (code >= 0x30 && code <= 0x39) digit = code - 0x30;
+      else if (code >= 0x61 && code <= 0x66) digit = code - 0x61 + 10;
+      else if (code >= 0x41 && code <= 0x46) digit = code - 0x41 + 10;
+      else {
+        framed = false;
+        break;
+      }
+      length = length * 16 + digit;
+    }
+    if (!framed) break;
     if (length === 0) {
       items.push({ kind: 'flush' });
       offset += 4;
@@ -584,8 +645,21 @@ export function decodePktLines(bytes: Buffer): { items: PktItem[]; consumed: num
 
 /** Wrap bytes in sideband band-1 pkt-lines (used for fetch packs and push reports). */
 export function sidebandWrap(data: Buffer): Buffer {
-  const parts: Buffer[] = [];
   const chunkSize = PKT_MAX_PAYLOAD - 1;
+  if (data.length <= chunkSize) {
+    // The one-chunk case (every bench pack and push report): header, band byte and payload
+    // written into a single allocation instead of nested concats.
+    const length = data.length + 1 + 4;
+    const out = Buffer.allocUnsafe(length);
+    out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+    out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+    out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+    out[3] = HEX_DIGITS.charCodeAt(length & 0xf);
+    out[4] = 1;
+    data.copy(out, 5);
+    return out;
+  }
+  const parts: Buffer[] = [];
   for (let offset = 0; offset < data.length; offset += chunkSize) {
     const chunk = data.subarray(offset, Math.min(data.length, offset + chunkSize));
     parts.push(encodePktLine(Buffer.concat([Buffer.from([1]), chunk])));

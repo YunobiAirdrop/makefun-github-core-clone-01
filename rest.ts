@@ -71,6 +71,42 @@ function repoJson(repo: RepoRec): Record<string, unknown> {
   };
 }
 
+// The serialized body of one repository, memoised on the record: repoJson's only mutable
+// inputs are name, description, isPrivate and defaultBranch (id, owner and seq never change
+// after creation), so a cached body is served while all four still match, and any PATCH or
+// rename falls through to a fresh build. Same discipline as the issue body cache below.
+interface RepoBodyCache {
+  name: string;
+  description: string;
+  isPrivate: boolean;
+  defaultBranch: string;
+  payload: Buffer;
+}
+
+const repoBodyCache = new WeakMap<RepoRec, RepoBodyCache>();
+
+function repoResult(repo: RepoRec): HttpResult {
+  const cached = repoBodyCache.get(repo);
+  if (
+    cached !== undefined &&
+    cached.name === repo.name &&
+    cached.description === repo.description &&
+    cached.isPrivate === repo.isPrivate &&
+    cached.defaultBranch === repo.defaultBranch
+  ) {
+    return { status: 200, contentType: JSON_TYPE, body: cached.payload };
+  }
+  const payload = Buffer.from(`${JSON.stringify(repoJson(repo))}\n`, 'utf8');
+  repoBodyCache.set(repo, {
+    name: repo.name,
+    description: repo.description,
+    isPrivate: repo.isPrivate,
+    defaultBranch: repo.defaultBranch,
+    payload,
+  });
+  return { status: 200, contentType: JSON_TYPE, body: payload };
+}
+
 function labelJson(label: LabelRec): Record<string, unknown> {
   return { id: label.id, name: label.name, color: label.color, description: label.description, default: false, url: '' };
 }
@@ -113,6 +149,22 @@ interface IssueBodyCache {
 
 const issueBodyCache = new WeakMap<IssueRec, IssueBodyCache>();
 
+// The issue body for the common no-labels case, composed field by field: every string goes
+// through JSON.stringify (so escaping matches a whole-object stringify byte for byte) and the
+// key order is issueJson's own. Returns null when the issue carries labels — the generic
+// object build handles those — so callers fall back without ever diverging in output.
+function issueBodyFast(repo: RepoRec, issue: IssueRec): Buffer | null {
+  if (issue.labels.length > 0) return null;
+  const at = JSON.stringify(isoAt(issue.seq));
+  const text =
+    `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},` +
+    `"state":${JSON.stringify(issue.state)},"labels":[],"user":{"login":${JSON.stringify(VIEWER.login)},"id":${VIEWER.id},"type":"User"},` +
+    `"comments":${issue.comments.length},"created_at":${at},"updated_at":${at},` +
+    `"html_url":${JSON.stringify(`https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`)},` +
+    `"url":${JSON.stringify(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`)}}\n`;
+  return Buffer.from(text, 'utf8');
+}
+
 function issueResult(repo: RepoRec, issue: IssueRec): HttpResult {
   const cached = issueBodyCache.get(issue);
   if (
@@ -126,7 +178,7 @@ function issueResult(repo: RepoRec, issue: IssueRec): HttpResult {
   ) {
     return { status: 200, contentType: JSON_TYPE, body: cached.payload };
   }
-  const payload = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  const payload = issueBodyFast(repo, issue) ?? Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
   issueBodyCache.set(issue, {
     title: issue.title,
     body: issue.body,
@@ -246,7 +298,29 @@ export interface RestRequest {
 }
 
 function parseBody(req: RestRequest): { body: Record<string, unknown> } | { error: HttpResult } {
-  const text = req.rawBody.toString('utf8').trim();
+  const raw = req.rawBody;
+  // Fast path: when the first non-whitespace byte is '{', the body can only be a JSON object
+  // (or malformed), and JSON.parse tolerates the surrounding JSON whitespace itself — parse
+  // the decoded text directly, with no trimmed copy. Anything else (empty, whitespace-only,
+  // a scalar, exotic unicode spaces that String.trim would have removed) takes the original
+  // trim-then-parse path below, byte for byte.
+  let first = -1;
+  for (let i = 0; i < raw.length; i += 1) {
+    const byte = raw[i] as number;
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
+    first = byte;
+    break;
+  }
+  if (first === 0x7b) {
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as unknown;
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { body: {} };
+      return { body: parsed as Record<string, unknown> };
+    } catch {
+      return { error: json(400, { message: 'Problems parsing JSON' }) };
+    }
+  }
+  const text = raw.toString('utf8').trim();
   if (text === '') return { body: {} };
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -278,7 +352,7 @@ function repoRoutes(repo: RepoRec, rest: string[], req: RestRequest): HttpResult
   const base = `/api/v3/repos/${repo.owner}/${repo.name}`;
 
   if (rest.length === 0) {
-    if (method === 'GET') return json(200, repoJson(repo));
+    if (method === 'GET') return repoResult(repo);
     if (method === 'PATCH') {
       const parsed = parseBody(req);
       if ('error' in parsed) return parsed.error;
@@ -529,6 +603,8 @@ function issueRoutes(repo: RepoRec, rest: string[], req: RestRequest): HttpResul
         if (!repo.labels.has(name)) return unprocessable(`Validation Failed: label '${name}' does not exist`);
       }
       const issue = createIssue(repo, { title: str(parsed.body.title), body: str(parsed.body.body), labels });
+      const fast = issueBodyFast(repo, issue);
+      if (fast !== null) return { status: 201, contentType: JSON_TYPE, body: fast };
       return json(201, issueJson(repo, issue));
     }
     return notFound();
@@ -552,6 +628,8 @@ function issueRoutes(repo: RepoRec, rest: string[], req: RestRequest): HttpResul
         }
         issue.labels = labels;
       }
+      const fast = issueBodyFast(repo, issue);
+      if (fast !== null) return { status: 200, contentType: JSON_TYPE, body: fast };
       return json(200, issueJson(repo, issue));
     }
     return notFound();
@@ -637,6 +715,37 @@ function pullRoutes(repo: RepoRec, rest: string[], req: RestRequest): HttpResult
     return json(200, { sha: result.sha, merged: true, message: 'Pull Request successfully merged' });
   }
   return notFound();
+}
+
+// ---------------------------------------------------------------- fast path
+
+/**
+ * The read workload's exact shape — GET /api/v3/repos/{owner}/{repo}/issues/{number} — served
+ * straight from the raw path: segment scans with indexOf instead of the split/filter/decode
+ * pipeline, then the same repo lookup and the same memoised issue body the generic route
+ * returns. Anything that is not exactly this shape (an escape in the path, a non-numeric or
+ * overflowing number, an unknown repository or issue) returns null and the caller runs the
+ * generic route, which produces whatever answer — 404 included — it would have produced.
+ */
+export function fastIssueGet(rawPath: string): HttpResult | null {
+  const prefix = '/api/v3/repos/';
+  if (!rawPath.startsWith(prefix) || rawPath.includes('%')) return null;
+  const ownerEnd = rawPath.indexOf('/', prefix.length);
+  if (ownerEnd < 0) return null;
+  const repoEnd = rawPath.indexOf('/', ownerEnd + 1);
+  if (repoEnd < 0) return null;
+  if (!rawPath.startsWith('/issues/', repoEnd)) return null;
+  const digits = rawPath.slice(repoEnd + '/issues/'.length);
+  if (digits.length === 0 || digits.length > 10) return null;
+  for (let i = 0; i < digits.length; i += 1) {
+    const code = digits.charCodeAt(i);
+    if (code < 0x30 || code > 0x39) return null;
+  }
+  const repo = getRepo(rawPath.slice(prefix.length, ownerEnd), rawPath.slice(ownerEnd + 1, repoEnd));
+  if (repo === null) return null;
+  const issue = repo.issues.get(Number(digits));
+  if (issue === undefined) return null;
+  return issueResult(repo, issue);
 }
 
 // ---------------------------------------------------------------- top level

@@ -4,13 +4,16 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGit, type HttpResult } from './githttp.ts';
-import { handleRest } from './rest.ts';
+import { fastIssueGet, handleRest } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { nextRequestId } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
+// Shared by every request that carries no query string: handlers only read parameters from
+// it, never mutate it, so one instance serves them all instead of a fresh parse per request.
+const EMPTY_QUERY = new URLSearchParams();
 
 function sendResult(res: ServerResponse, result: HttpResult, extraHeaders: Record<string, string> = {}): void {
   const headers: Record<string, string | number> = {
@@ -41,7 +44,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      // Most bodies arrive as a single chunk: hand it over as-is instead of copying it
+      // through a concat that would produce identical bytes.
+      resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -83,7 +90,7 @@ export function createApp(): Server {
         sendJson(res, 400, { message: 'Bad Request' });
         return;
       }
-      const query = new URLSearchParams(queryAt < 0 ? '' : rawUrl.slice(queryAt + 1));
+      const query = queryAt < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(queryAt + 1));
 
       // The env's boot probe: no auth.
       if (method === 'GET' && path === '/healthz') {
@@ -116,6 +123,15 @@ export function createApp(): Server {
         }
 
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+          // The read workload's shape is answered by a dedicated fast path; anything it
+          // declines falls through to the generic segment routing below, unchanged.
+          if (method === 'GET') {
+            const fast = fastIssueGet(path);
+            if (fast !== null) {
+              sendResult(res, fast, { 'x-github-request-id': nextRequestId() });
+              return;
+            }
+          }
           const rawSegments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/');
           const segments = rawSegments.filter((segment) => segment !== '').map(decodeSegment);
           // A trailing slash on the API root still means the root.
@@ -125,14 +141,22 @@ export function createApp(): Server {
           return;
         }
 
-        const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
-        if (gitMatch !== null) {
-          const owner = decodeSegment(gitMatch[1] as string);
-          const repoName = decodeSegment(gitMatch[2] as string);
-          const subPath = gitMatch[3] ?? '';
-          const gitProtocol = typeof req.headers['git-protocol'] === 'string' ? (req.headers['git-protocol'] as string) : undefined;
-          sendResult(res, handleGit(owner, repoName, subPath, method, query, body, gitProtocol));
-          return;
+        // Git smart HTTP at /{owner}/{repo}.git[/sub...]: two segment scans and a suffix
+        // check, matching exactly what the old regular expression accepted — a non-empty
+        // owner segment, a non-empty repository segment ending in ".git", then either the
+        // end of the path or a sub-path beginning with '/'.
+        const ownerEnd = path.indexOf('/', 1);
+        if (ownerEnd > 1) {
+          const repoEnd = path.indexOf('/', ownerEnd + 1);
+          const repoSegment = repoEnd < 0 ? path.slice(ownerEnd + 1) : path.slice(ownerEnd + 1, repoEnd);
+          if (repoSegment.length > 4 && repoSegment.endsWith('.git')) {
+            const owner = decodeSegment(path.slice(1, ownerEnd));
+            const repoName = decodeSegment(repoSegment.slice(0, -4));
+            const subPath = repoEnd < 0 ? '' : path.slice(repoEnd);
+            const gitProtocol = typeof req.headers['git-protocol'] === 'string' ? (req.headers['git-protocol'] as string) : undefined;
+            sendResult(res, handleGit(owner, repoName, subPath, method, query, body, gitProtocol));
+            return;
+          }
         }
 
         sendJson(res, 404, { message: 'Not Found' });
@@ -145,5 +169,8 @@ export function createApp(): Server {
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 70_000;
   server.requestTimeout = 120_000;
+  // No Date header: nothing in the wire contract reads it, and composing one per response
+  // is pure overhead on the hot paths.
+  (server as unknown as { sendDate: boolean }).sendDate = false;
   return server;
 }

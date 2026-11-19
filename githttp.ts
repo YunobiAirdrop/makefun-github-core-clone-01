@@ -11,6 +11,7 @@ import {
   parseTree,
   peelToCommit,
   pktFlush,
+  pktLines,
   reachableObjects,
   readPack,
   sidebandWrap,
@@ -45,27 +46,25 @@ function sortedRefs(repo: RepoRec): [string, string][] {
 
 function advertisementV0(repo: RepoRec, service: string): HttpResult {
   const caps = service === 'git-receive-pack' ? RECEIVE_CAPS : UPLOAD_CAPS;
-  const parts: Buffer[] = [encodePktLine(`# service=${service}\n`), pktFlush()];
   const refs = sortedRefs(repo);
   const headTarget = `refs/heads/${repo.defaultBranch}`;
   const headOid = repo.refs.get(headTarget);
   const lines: string[] = [];
   if (refs.length === 0) {
-    lines.push(`${ZERO_OID} capabilities^{}\0${caps}`);
+    lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
-    lines.push(`${headOid ?? ZERO_OID} HEAD\0${caps}`);
+    lines.push(`${headOid ?? ZERO_OID} HEAD\0${caps}\n`);
     for (const [name, oid] of refs) {
-      lines.push(`${oid} ${name}`);
+      lines.push(`${oid} ${name}\n`);
       const target = repo.objects.get(oid);
       if (name.startsWith('refs/tags/') && target !== undefined && target.type === 'tag') {
         const peeled = peelToCommit(repo.objects, oid);
-        if (peeled !== null) lines.push(`${peeled} ${name}^{}`);
+        if (peeled !== null) lines.push(`${peeled} ${name}^{}\n`);
       }
     }
   }
-  for (const line of lines) parts.push(encodePktLine(`${line}\n`));
-  parts.push(pktFlush());
-  return { status: 200, contentType: `application/x-${service}-advertisement`, body: Buffer.concat(parts) };
+  const body = Buffer.concat([encodePktLine(`# service=${service}\n`), pktFlush(), pktLines(lines), pktFlush()]);
+  return { status: 200, contentType: `application/x-${service}-advertisement`, body };
 }
 
 // The v2 advertisement names no ref and never changes: build its body once, serve it forever.
@@ -122,11 +121,10 @@ function lsRefs(repo: RepoRec, args: LsRefsArgs): HttpResult {
     }
     lines.push(line);
   }
-  const parts = lines.map((line) => encodePktLine(`${line}\n`));
-  parts.push(pktFlush());
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const framed = lines.map((line) => `${line}\n`);
+  const body = Buffer.concat([pktLines(framed), pktFlush()]);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
 }
-
 // ---------------------------------------------------------------- fetch
 
 interface FetchRequest {
@@ -224,15 +222,21 @@ function selectFetchObjects(repo: RepoRec, request: FetchRequest): FetchSelectio
   return { objects: list, shallow: [...boundary], unshallow };
 }
 
-// Generated packs are a pure function of the request and the object store's contents: objects
-// are content-addressed and immutable, and the key carries the store size, so any push (which
-// only ever adds objects) changes the key before a stale pack could be served. Repeated fetches
-// of the same tip — fifty concurrent shallow clones of one repository above all — reuse the
-// first pack byte for byte instead of re-walking and re-deflating the same objects each time.
+// Generated packs are a pure function of the request and the object graph it names: objects
+// are content-addressed and immutable, and a fetch selection is fully determined by its wants,
+// haves, shallow boundary and depth — adding unrelated objects to the store (a push to another
+// branch, say) cannot change what an existing want set selects. Repeated fetches of the same
+// tip — fifty concurrent shallow clones of one repository above all — therefore reuse the
+// first pack byte for byte instead of re-walking and re-deflating the same objects each time,
+// and the fully framed response bodies are memoised on the same entry: the shallow-info and
+// packfile sections of a v2 answer (and the ACK line of a v0 one) are functions of the same
+// selection, so a cache hit returns the finished bytes without re-framing anything.
 interface PackCacheEntry {
   pack: Buffer;
   shallow: string[];
   unshallow: string[];
+  bodyV2: Buffer | null;
+  bodyV0: Buffer | null;
 }
 
 const packCache = new Map<string, PackCacheEntry>();
@@ -240,10 +244,10 @@ const PACK_CACHE_LIMIT = 256;
 
 function packCacheKey(repo: RepoRec, request: FetchRequest): string {
   const sorted = (values: string[]): string => [...values].sort().join(',');
+  // The repository's id, not its name: ids are never reused, so a repository deleted and
+  // recreated under the same name can never inherit the old one's cached packs.
   return [
-    repo.owner,
-    repo.name,
-    repo.objects.size,
+    repo.id,
     request.depth ?? '',
     sorted(request.wants),
     sorted(request.haves),
@@ -251,22 +255,30 @@ function packCacheKey(repo: RepoRec, request: FetchRequest): string {
   ].join('|');
 }
 
-function buildPack(repo: RepoRec, request: FetchRequest): { pack: Buffer; selection: FetchSelection } {
+function buildPack(repo: RepoRec, request: FetchRequest): PackCacheEntry {
   const key = packCacheKey(repo, request);
   const hit = packCache.get(key);
-  if (hit !== undefined) {
-    return { pack: hit.pack, selection: { objects: [], shallow: hit.shallow, unshallow: hit.unshallow } };
-  }
+  if (hit !== undefined) return hit;
   const selection = selectFetchObjects(repo, request);
   const pack = writePack(selection.objects);
+  const entry: PackCacheEntry = { pack, shallow: selection.shallow, unshallow: selection.unshallow, bodyV2: null, bodyV0: null };
+  // Cache only a selection whose inputs the store already fully holds: when every want, have
+  // and shallow oid is present, the walk's closure is fixed by content addressing and no later
+  // push can change it. A request naming an oid the store lacks is answered fresh each time,
+  // so a push that lands that oid is picked up by the next identical fetch.
+  const closed =
+    request.wants.every((oid) => repo.objects.has(oid)) &&
+    request.haves.every((oid) => repo.objects.has(oid)) &&
+    request.shallow.every((oid) => repo.objects.has(oid));
+  if (!closed) return entry;
   if (packCache.size >= PACK_CACHE_LIMIT) packCache.clear();
-  packCache.set(key, { pack, shallow: selection.shallow, unshallow: selection.unshallow });
-  return { pack, selection };
+  packCache.set(key, entry);
+  return entry;
 }
 
 function fetchV2(repo: RepoRec, request: FetchRequest): HttpResult {
-  const parts: Buffer[] = [];
   if (!request.done) {
+    const parts: Buffer[] = [];
     parts.push(encodePktLine('acknowledgments\n'));
     const common = request.haves.filter((have) => repo.objects.has(have));
     if (common.length === 0) {
@@ -277,32 +289,47 @@ function fetchV2(repo: RepoRec, request: FetchRequest): HttpResult {
     parts.push(pktFlush());
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
   }
-  const { pack, selection } = buildPack(repo, request);
+  const entry = buildPack(repo, request);
+  if (entry.bodyV2 !== null) {
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: entry.bodyV2 };
+  }
+  const parts: Buffer[] = [];
   if (request.depth !== null || request.shallow.length > 0) {
     parts.push(encodePktLine('shallow-info\n'));
-    for (const oid of selection.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-    for (const oid of selection.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    for (const oid of entry.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of entry.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
     parts.push(pktFlush());
   }
   parts.push(encodePktLine('packfile\n'));
-  parts.push(sidebandWrap(pack));
+  parts.push(sidebandWrap(entry.pack));
   parts.push(pktFlush());
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  entry.bodyV2 = body;
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
 }
 
 function fetchV0(repo: RepoRec, request: FetchRequest): HttpResult {
-  const { pack, selection } = buildPack(repo, request);
+  const entry = buildPack(repo, request);
+  // The memoised body is served only when the request names no haves: the ACK/NAK line is
+  // then always NAK and every other byte is a function of the cached selection. With haves,
+  // the ACK names the first one the store currently holds, which a later push can change,
+  // so those answers are framed fresh each time.
+  if (request.haves.length === 0 && entry.bodyV0 !== null) {
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: entry.bodyV0 };
+  }
   const parts: Buffer[] = [];
   if (request.depth !== null || request.shallow.length > 0) {
-    for (const oid of selection.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-    for (const oid of selection.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    for (const oid of entry.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of entry.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
   }
   const common = request.haves.filter((have) => repo.objects.has(have));
   if (common.length > 0) parts.push(encodePktLine(`ACK ${common[0]}\n`));
   else parts.push(encodePktLine('NAK\n'));
-  parts.push(sidebandWrap(pack));
+  parts.push(sidebandWrap(entry.pack));
   parts.push(pktFlush());
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const body = Buffer.concat(parts);
+  if (request.haves.length === 0) entry.bodyV0 = body;
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
 }
 
 function parseFetchArgs(lines: string[], request: FetchRequest): void {
@@ -430,7 +457,7 @@ function receivePack(repo: RepoRec, body: Buffer): HttpResult {
   if (!useReport) {
     return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.alloc(0) };
   }
-  const inner = Buffer.concat([...reportLines.map((line) => encodePktLine(line)), pktFlush()]);
+  const inner = Buffer.concat([pktLines(reportLines), pktFlush()]);
   const bodyOut = useSideband ? Buffer.concat([sidebandWrap(inner), pktFlush()]) : inner;
   return { status: 200, contentType: 'application/x-git-receive-pack-result', body: bodyOut };
 }
